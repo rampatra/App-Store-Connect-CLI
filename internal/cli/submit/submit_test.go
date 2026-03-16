@@ -610,6 +610,52 @@ func newSubmitTestClient(t *testing.T, transport http.RoundTripper) *asc.Client 
 	return client
 }
 
+func captureSubmitStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+
+	os.Stderr = w
+	defer func() {
+		os.Stderr = oldStderr
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("stderr close error: %v", err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("stderr read error: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("stderr reader close error: %v", err)
+	}
+	return string(data)
+}
+
+func TestCleanupEmptyReviewSubmissionWarnsOnUnexpectedCancelFailure(t *testing.T) {
+	client := newSubmitTestClient(t, submitRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPatch || req.URL.Path != "/v1/reviewSubmissions/sub-1" {
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return submitJSONResponse(http.StatusBadGateway, `{"errors":[{"status":"502","code":"BAD_GATEWAY","title":"Bad Gateway"}]}`)
+	}))
+
+	stderr := captureSubmitStderr(t, func() {
+		cleanupEmptyReviewSubmission(context.Background(), client, "sub-1")
+	})
+
+	if !strings.Contains(stderr, "Warning: failed to cancel empty submission sub-1") {
+		t.Fatalf("expected cleanup warning in stderr, got %q", stderr)
+	}
+}
+
 func submitAlreadyAddedConflictBody(existingSubmissionID string) string {
 	return fmt.Sprintf(`{
 		"errors": [{

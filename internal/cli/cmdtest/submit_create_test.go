@@ -516,15 +516,126 @@ func TestSubmitCreateSilentlySkipsConflictOnStaleSubmissionCancel(t *testing.T) 
 		}
 	})
 
-	// 409 Conflict should produce a clear info message, not the scary "Warning: failed to cancel" dump
+	// 409 Conflict is expected when the stale submission already moved into a
+	// non-cancellable state, so submit create should stay quiet about it.
 	if strings.Contains(stderr, "Warning: failed to cancel stale submission") {
 		t.Fatalf("expected no warning for 409 conflict on stale cancel, got: %q", stderr)
 	}
-	if !strings.Contains(stderr, "Skipped stale submission stale-1: already transitioned to a non-cancellable state") {
-		t.Fatalf("expected info message about skipped stale submission, got: %q", stderr)
+	if strings.Contains(stderr, "stale submission stale-1") {
+		t.Fatalf("expected no stale submission message for 409 conflict, got: %q", stderr)
 	}
 	if stdout == "" {
 		t.Fatal("expected JSON output on stdout")
+	}
+}
+
+func TestSubmitCreatePrintsActionableHintsWhenAddVersionFails(t *testing.T) {
+	setupSubmitCreateAuth(t)
+
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() {
+		http.DefaultTransport = originalTransport
+	})
+
+	http.DefaultTransport = submitCreateRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/apps/app-1/appStoreVersions":
+			if req.URL.Query().Get("filter[appStoreState]") != "" {
+				return submitCreateJSONResponse(http.StatusOK, `{"data":[]}`)
+			}
+			return submitCreateJSONResponse(http.StatusOK, `{"data":[{"type":"appStoreVersions","id":"version-1","attributes":{"versionString":"1.0","platform":"IOS"}}]}`)
+
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/appStoreVersions/version-1/appStoreVersionLocalizations":
+			return submitCreateJSONResponse(http.StatusOK, `{"data":[{"type":"appStoreVersionLocalizations","id":"loc-en","attributes":{"locale":"en-US","description":"Description","keywords":"keyword","supportUrl":"https://example.com/support"}}]}`)
+
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/apps/app-1/subscriptionGroups":
+			return submitCreateJSONResponse(http.StatusOK, `{"data":[]}`)
+
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/apps/app-1/reviewSubmissions":
+			return submitCreateJSONResponse(http.StatusOK, `{"data":[],"links":{}}`)
+
+		case req.Method == http.MethodPatch && req.URL.Path == "/v1/appStoreVersions/version-1/relationships/build":
+			return submitCreateJSONResponse(http.StatusNoContent, "")
+
+		case req.Method == http.MethodPost && req.URL.Path == "/v1/reviewSubmissions":
+			return submitCreateJSONResponse(http.StatusCreated, `{"data":{"type":"reviewSubmissions","id":"new-sub-1","attributes":{"state":"READY_FOR_REVIEW","platform":"IOS"}}}`)
+
+		case req.Method == http.MethodPost && req.URL.Path == "/v1/reviewSubmissionItems":
+			return submitCreateJSONResponse(http.StatusConflict, `{
+				"errors": [{
+					"status": "409",
+					"code": "STATE_ERROR.ENTITY_STATE_INVALID",
+					"title": "The request entity is not valid.",
+					"detail": "This resource cannot be reviewed, please check associated errors to see why.",
+					"meta": {
+						"associatedErrors": {
+							"/v1/ageRatingDeclarations/age-rating-1": [{
+								"code": "ENTITY_ERROR.ATTRIBUTE.REQUIRED",
+								"detail": "Age rating details are missing."
+							}],
+							"/v1/appInfos/info-1": [{
+								"code": "ENTITY_ERROR.ATTRIBUTE.REQUIRED",
+								"detail": "contentRightsDeclaration must be provided."
+							}],
+							"/v1/appDataUsages/usage-1": [{
+								"code": "ENTITY_ERROR.ATTRIBUTE.REQUIRED",
+								"detail": "appDataUsage must be completed."
+							}],
+							"/v1/appInfos/info-1/relationships/primaryCategory": [{
+								"code": "ENTITY_ERROR.ATTRIBUTE.REQUIRED",
+								"detail": "primaryCategory must be configured."
+							}]
+						}
+					}
+				}]
+			}`)
+
+		case req.Method == http.MethodPatch && req.URL.Path == "/v1/reviewSubmissions/new-sub-1":
+			return submitCreateJSONResponse(http.StatusOK, `{"data":{"type":"reviewSubmissions","id":"new-sub-1","attributes":{"state":"CANCELING","platform":"IOS"}}}`)
+
+		default:
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+
+	root := RootCommand("1.2.3")
+	root.FlagSet.SetOutput(io.Discard)
+
+	var runErr error
+	stdout, stderr := captureOutput(t, func() {
+		if err := root.Parse([]string{
+			"submit", "create",
+			"--app", "app-1",
+			"--version", "1.0",
+			"--build", "build-1",
+			"--platform", "IOS",
+			"--confirm",
+		}); err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		runErr = root.Run(context.Background())
+	})
+
+	if runErr == nil {
+		t.Fatal("expected run error, got nil")
+	}
+	if stdout != "" {
+		t.Fatalf("expected empty stdout on failure, got %q", stdout)
+	}
+	if !strings.Contains(runErr.Error(), "submit create: failed to add version to submission") {
+		t.Fatalf("expected wrapped add-version error, got %v", runErr)
+	}
+	if !strings.Contains(stderr, "Hint: Fix age rating: asc age-rating set --app app-1") {
+		t.Fatalf("expected age rating hint, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "Hint: Set content rights: asc app-setup info set --app app-1 --content-rights DOES_NOT_USE_THIRD_PARTY_CONTENT|USES_THIRD_PARTY_CONTENT") {
+		t.Fatalf("expected content rights hint, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "Hint: Complete App Privacy at: https://appstoreconnect.apple.com/apps/app-1/appPrivacy") {
+		t.Fatalf("expected app privacy hint, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "Hint: Set category: asc app-setup categories set --app app-1 --primary SPORTS") {
+		t.Fatalf("expected category hint, got %q", stderr)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -659,9 +660,12 @@ func cleanupEmptyReviewSubmission(ctx context.Context, client *asc.Client, submi
 	if strings.TrimSpace(submissionID) == "" {
 		return
 	}
-	// Failures here are expected when the submission is already in a
-	// non-cancellable state; silently ignore them.
-	_, _ = client.CancelReviewSubmission(ctx, submissionID)
+	if _, err := client.CancelReviewSubmission(ctx, submissionID); err != nil {
+		if shouldSilenceReviewSubmissionCancelError(err) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Warning: failed to cancel empty submission %s: %v\n", submissionID, err)
+	}
 }
 
 // cancelStaleReviewSubmissions cancels any READY_FOR_REVIEW submissions for the
@@ -692,8 +696,10 @@ func cancelStaleReviewSubmissions(ctx context.Context, client *asc.Client, appID
 		}
 
 		if _, cancelErr := client.CancelReviewSubmission(ctx, sub.ID); cancelErr != nil {
-			// Stale submissions in non-cancellable states are expected;
-			// silently skip them to avoid confusing the user.
+			if shouldSilenceReviewSubmissionCancelError(cancelErr) {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "Warning: failed to cancel stale submission %s: %v\n", sub.ID, cancelErr)
 			continue
 		}
 		canceledSubmissionIDs[sub.ID] = struct{}{}
@@ -706,25 +712,49 @@ func cancelStaleReviewSubmissions(ctx context.Context, client *asc.Client, appID
 	return canceledSubmissionIDs
 }
 
+func shouldSilenceReviewSubmissionCancelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, asc.ErrConflict) {
+		return true
+	}
+
+	var apiErr *asc.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode == http.StatusConflict {
+		return true
+	}
+
+	errMsg := strings.ToLower(strings.Join([]string{
+		apiErr.Code,
+		apiErr.Title,
+		apiErr.Detail,
+	}, " "))
+	return strings.Contains(errMsg, "not in cancellable state")
+}
+
 // printSubmissionErrorHints inspects an error returned by App Store Connect
 // during submission and prints actionable fix suggestions to stderr.
 func printSubmissionErrorHints(err error, appID string) {
 	if err == nil {
 		return
 	}
-	errMsg := err.Error()
+	errMsg := strings.ToLower(err.Error())
 
 	var hints []string
-	if strings.Contains(errMsg, "ageRatingDeclaration") {
+	if strings.Contains(errMsg, "ageratingdeclaration") {
 		hints = append(hints, fmt.Sprintf("Fix age rating: asc age-rating set --app %s --gambling false --violence-realistic NONE ... (set all descriptors to NONE/false)", appID))
 	}
-	if strings.Contains(errMsg, "contentRightsDeclaration") {
-		hints = append(hints, fmt.Sprintf("Content rights must be set in App Store Connect: https://appstoreconnect.apple.com/apps/%s", appID))
+	if strings.Contains(errMsg, "contentrightsdeclaration") {
+		hints = append(hints, fmt.Sprintf("Set content rights: asc app-setup info set --app %s --content-rights DOES_NOT_USE_THIRD_PARTY_CONTENT|USES_THIRD_PARTY_CONTENT", appID))
 	}
-	if strings.Contains(errMsg, "appDataUsage") {
+	if strings.Contains(errMsg, "appdatausage") {
 		hints = append(hints, fmt.Sprintf("Complete App Privacy at: https://appstoreconnect.apple.com/apps/%s/appPrivacy", appID))
 	}
-	if strings.Contains(errMsg, "primaryCategory") {
+	if strings.Contains(errMsg, "primarycategory") {
 		hints = append(hints, fmt.Sprintf("Set category: asc app-setup categories set --app %s --primary SPORTS", appID))
 	}
 
